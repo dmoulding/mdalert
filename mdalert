@@ -1,0 +1,175 @@
+#!/bin/bash
+
+readonly conf=/etc/mdalert
+
+event=$1
+array=$2
+other=$3
+
+function alert_none()
+{
+    :
+}
+
+function alert_mail()
+{
+    mailto=${mailto:-${DEFAULT_MAILTO}}
+    if [[ -z "$mailto" ]]; then
+        logger -p ${facility}.err \
+            "mdalert: No mail-to addresses configured; unable to send mail; message: $message"
+        status=1
+        return
+    fi
+
+    mail -s "RAID event on $(hostname)" $mailto <<< "$message"
+    if [[ $? -ne 0 ]]; then
+        logger -p ${facility}.err \
+            "mdalert: mailx to $mailto failed; message: $message"
+        status=1
+    fi
+}
+
+function alert_syslog()
+{
+    logger -p ${facility}.${level:-warning} "$message"
+    if [[ $? -ne 0 ]]; then
+        echo "mdalert: Logging to syslog failed; message: $message" \
+             > /dev/console
+        status=1
+    fi
+}
+
+function alert_wall()
+{
+    wall -n -t 30 "$message"
+    if [[ $? -ne 0 ]]; then
+        logger -p ${facility}.err \
+            "mdalert: Broadcasting message to all users failed; message: $message"
+        status=1
+    fi
+}
+
+if [[ -f "$conf" ]]; then
+   source "$conf"
+fi
+
+if [[ "$event" =~ ^Rebuild[[:digit:]]{2}$ ]]; then
+    progress=${event#Rebuild}
+    progress=${progress#0}
+    event=RebuildNN
+fi
+
+facility=${SYSLOG_FACILITY:-daemon}
+level_name=${event}_SEVERITY
+level=${!level_name}
+mailto_name=${event}_MAILTO
+mailto=${!mailto_name}
+methods_name=${event}_METHODS
+methods=${!methods_name}
+status=0
+
+case "$event" in
+    DegradedArray)
+        level=${level:-alert}
+        message="Array $array is operating in degraded mode"
+        ;;
+
+    DeviceDisappeared)
+        # Other may be "Wrong-Level" if mdadm was asked to monitor a
+        # RAID0 or linear array
+        if [[ "$other" == Wrong-Level ]]; then
+            if [[ -n "$WrongLevel_METHODS" ]]; then
+                methods=$WrongLevel_METHODS
+            fi
+            if [[ -n "WrongLevel_SEVERITY" ]]; then
+                level=$WrongLevel_SEVERITY
+            fi
+            level=${level:-notice}
+            message="Array $array is RAID0 or linear and can't be monitored"
+        else
+            level=${level:-crit}
+            message="Array $array has disappeared"
+        fi
+        ;;
+
+    Fail)
+        # Other is failed component
+        level=${level:-alert}
+        message="Active component $other of array $array has FAILED"
+        ;;
+
+    FailSpare)
+        # Other is failed spare
+        level=${level:-crit}
+        message="Spare device $other of array $array has FAILED"
+        ;;
+
+    MoveSpare)
+        # Other is array spare was moved from
+        level=${level:-notice}
+        message="Spare device moved from array $other to array $array"
+        ;;
+
+    NewArray)
+        level=${level:-info}
+        message="Array $array is now active"
+        ;;
+
+    RebuildNN)
+        level=${level:-notice}
+        message="Rebuild of array $array is ${progress}% complete"
+        ;;
+
+    RebuildFinished)
+        level=${level:-notice}
+        message="Rebuild of array $array is complete (or was stopped)"
+        ;;
+
+    RebuildStarted)
+        level=${level:-warning}
+        message="Array $array has started rebuilding"
+        ;;
+
+    SpareActive)
+        # Other is activated spare component
+        level=${level:-notice}
+        message="Rebuilt spare device $other is now active on array $array"
+        ;;
+
+    SparesMissing)
+        level=${level:-warning}
+        message="One or more spare devices are missing from array $array"
+        ;;
+
+    *)
+        if [[ "$event" == TestMessage ]]; then
+            level=${level:-info}
+        else
+            level=notice
+        fi
+        message="$event event for array $array${other:+, extra info: $other}"
+        ;;
+esac
+
+
+if [[ -z "$methods" ]]; then
+    methods=${DEFAULT_METHODS:-syslog wall}
+fi
+
+for method in $methods; do
+    if type alert_$method &> /dev/null; then
+        alert_$method
+    else
+        logger -p ${facility}.err \
+            "mdalert: No alert handler defined for method \"$method\""
+        status=1
+        alert_wall
+    fi
+done
+
+exit $status
+
+# Local Variables:
+# sh-basic-offset: 4
+# indent-tabs-mode: nil
+# End:
